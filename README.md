@@ -75,7 +75,7 @@ typedef struct {
     
     // Version Control
     uint32_t sequence_number;       // 0x02-0x05: Block sequence number
-    // Note: For same file/chunk in same block, use higher sequence number
+    // Note: For same chunk with same seq_num in same block, use later one
     
     // Object ID
     uint16_t obj_id_low;            // 0x06-0x07: File ID lower 16 bits
