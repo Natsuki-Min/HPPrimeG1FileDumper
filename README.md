@@ -131,7 +131,9 @@ typedef struct {
 1. **Calculator not detected**: Ensure you're in recovery mode (reset + `Symb`)
 2. **Drive size unchanged**: Re-run usbtool.exe update process
 3. **Extraction errors**: Verify NAND/OOB dump sizes are correct
-
+4. **I cant enter Recovery after i patch the bootloader**: as the hardware design of V1 and V2's key board is slightly different ,if you accidently update V2's bootloader to V13,you wont be able to enter recovery via keyboard.Contact the author and i will provide tools to fix this.Or you can try 1.set SFR inform3(0x4C00007C) to 0xa5a5a5a5 or 2.Use metal-tipped tweezers to short the GPG4 and GPD2 nets. Short them at their corresponding CPU-side connection points on the specific resistor array near the keyboard flex cable: short the CPU-side pin of the GPD2 net on the second resistor (from the left) and the CPU-side pin of the GPG4 net on the third resistor (from the left), among the set of four resistors closest to the keyboard flex cable. (Assumption: keyboard is facing down, screen is facing up.)
+BTW, the keyboard flex cable pinout, from right to left, is: GND, GND, GPG0-7, UNK_GPIO, BAT+, BAT+, GPD0-7, RESET, GND, GND.
+   
 ### Sequence Number Rules:
 - Same file/chunk in same block → use later position
 - Same file/chunk with different sequence numbers → error condition
