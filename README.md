@@ -19,8 +19,9 @@ Use this tool at your own risk. The author is not responsible for any damage to 
 ### Step 2: Patch Bootloader
 1. Connect calculator to computer via USB
 2. Run `usbtool.exe`
-3. Check **"Auto Update"** box
-4. Click **"Update"** (this patches the bootloader without affecting your data)
+3. Rename BXCBOOT0V**.bin to BXCBOOT0.bin (V13 is suitable only for V1 while V16 is suitable for both V1 and V2)
+4. Check **"Auto Update"** box
+5. Click **"Update"** (this patches the bootloader without affecting your data)
 
 ### Step 3: Dump NAND Data
 1. After updating, re-enter recovery mode (reset + `Symb`)
