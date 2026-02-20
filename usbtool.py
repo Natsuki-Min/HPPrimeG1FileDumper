@@ -5,6 +5,8 @@ import os
 import sys
 import struct
 import argparse
+import ctypes 
+
 from contextlib import contextmanager
 
 # 尝试导入平台特定的库
@@ -21,7 +23,8 @@ if sys.platform == 'win32':
     except ImportError:
         print("错误: 在Windows上, 请安装 'pywin32' 库 (pip install pywin32)")
         sys.exit(1)
-
+else:
+    import fcntl  
 # --- 从逆向分析中得到的协议常量 ---
 SECTOR_SIZE = 512
 CONTROL_LBA = 170
@@ -37,7 +40,36 @@ CMD_REBOOT = 0xBEC1
 CMD_SCAN_BAD_BLOCKS = 0xBEC2 # 建议在烧写前执行，但按要求未作为独立功能
 CMD_UPDATE_PROGRESS = 0xBEDC
 
+SG_IO = 0x2285
+SG_DXFER_FROM_DEV = -3
+SG_DXFER_TO_DEV = -2
 
+class sg_io_hdr(ctypes.Structure):
+    _fields_ = [
+        ('interface_id', ctypes.c_int),    # 'S'
+        ('dxfer_direction', ctypes.c_int), # SG_DXFER_FROM_DEV
+        ('cmd_len', ctypes.c_ubyte),       # Length of SCSI command (10)
+        ('mx_sb_len', ctypes.c_ubyte),     # Max sense buffer len
+        ('iovec_count', ctypes.c_ushort),  # 0
+        ('dxfer_len', ctypes.c_uint),      # Byte count to read
+        ('dxferp', ctypes.c_void_p),       # Pointer to data buffer
+        ('cmdp', ctypes.c_void_p),         # Pointer to command buffer
+        ('sbp', ctypes.c_void_p),          # Pointer to sense buffer
+        ('timeout', ctypes.c_uint),        # Milliseconds
+        ('flags', ctypes.c_uint),
+        ('pack_id', ctypes.c_int),
+        ('usr_ptr', ctypes.c_void_p),
+        ('status', ctypes.c_ubyte),
+        ('masked_status', ctypes.c_ubyte),
+        ('msg_status', ctypes.c_ubyte),
+        ('sb_len_wr', ctypes.c_ubyte),
+        ('host_status', ctypes.c_ushort),
+        ('driver_status', ctypes.c_ushort),
+        ('resid', ctypes.c_int),
+        ('duration', ctypes.c_uint),
+        ('info', ctypes.c_uint),
+    ]
+    
 class S3C2416Downloader:
     """
     S3C2416 Bootloader下载工具，通过原生SCSI磁盘接口通信。
@@ -64,7 +96,7 @@ class S3C2416Downloader:
         try:
             if self.platform.startswith('linux'):
                 # 在Linux上, 使用 os.open 获取文件描述符
-                flags = os.O_RDONLY if read_only else os.O_RDWR
+                flags = (os.O_RDONLY if read_only else os.O_RDWR) | os.O_DSYNC
                 handle = os.open(self.device_path, flags)
                 yield handle
             elif self.platform == 'win32':
@@ -102,6 +134,7 @@ class S3C2416Downloader:
             os.lseek(handle, offset, os.SEEK_SET)
             if data:
                 written = os.write(handle, data)
+                os.fsync(handle)
                 if written != len(data):
                     raise IOError(f"写入错误: 期望写入 {len(data)} 字节, 实际写入 {written}")
             else:
@@ -119,32 +152,120 @@ class S3C2416Downloader:
 
     def _send_control_command(self, cmd_id, arg=0):
         """
-        构造并发送一个512字节的控制命令到CONTROL_LBA。
+        Constructs and sends a 512-byte control command.
+        Uses SG_IO on Linux to bypass Read-Modify-Write alignment issues.
         """
+        # 1. Construct the data packet (512 bytes)
         command_packet = struct.pack(
-            '<IIIII', # Little-endian, 5x unsigned int
+            '<IIIII',  # Little-endian, 5x unsigned int
             CMD_MAGIC1,
             CMD_MAGIC2,
             CMD_HEADER_SIZE,
-            cmd_id ,
+            cmd_id,
             arg
         )
-        # 用0填充到512字节
         command_packet = command_packet.ljust(CMD_HEADER_SIZE, b'\x00')
 
-        with self._get_device_handle() as h:
-            self._seek_and_op(h, CONTROL_LBA, data=command_packet)
-        print(f"控制命令 0x{cmd_id:X} (参数: {arg}) 已发送。")
+        print(f"Sending Control Command 0x{cmd_id:X} (Arg: {arg})...")
+
+        if self.platform.startswith('linux'):
+            # --- Linux: Use SG_IO WRITE_10 ---
+            # We must force a write of exactly 1 sector to LBA 170.
+            # Standard os.write would trigger a 4KB Read-Modify-Write cycle.
+            
+            # SCSI WRITE_10 Opcode = 0x2A
+            # CDB: [0x2A, 0, LBA_3, LBA_2, LBA_1, LBA_0, 0, LEN_H, LEN_L, Control]
+            cdb = struct.pack(
+                '>BBIBH B',
+                0x2A, 0, CONTROL_LBA, 0, 1, 0  # Length = 1 sector
+            )
+
+            # Prepare buffers
+            data_buffer = (ctypes.c_ubyte * len(command_packet)).from_buffer_copy(command_packet)
+            sense_buffer = (ctypes.c_ubyte * 32)()
+            cmd_buffer = (ctypes.c_ubyte * len(cdb)).from_buffer_copy(cdb)
+
+            io_hdr = sg_io_hdr()
+            io_hdr.interface_id = ord('S')
+            io_hdr.dxfer_direction = SG_DXFER_TO_DEV  # -2 (Write to device)
+            io_hdr.cmd_len = len(cdb)
+            io_hdr.mx_sb_len = len(sense_buffer)
+            io_hdr.dxfer_len = len(command_packet)
+            io_hdr.dxferp = ctypes.cast(data_buffer, ctypes.c_void_p)
+            io_hdr.cmdp = ctypes.cast(cmd_buffer, ctypes.c_void_p)
+            io_hdr.sbp = ctypes.cast(sense_buffer, ctypes.c_void_p)
+            io_hdr.timeout = 5000
+
+            with self._get_device_handle(read_only=False) as fd:
+                try:
+                    fcntl.ioctl(fd, SG_IO, io_hdr)
+                    print("Linux SG_IO Write command sent successfully.")
+                except OSError as e:
+                    print(f"Error sending SG_IO Write: {e}")
+                    raise
+
+        else:
+            # --- Windows: Standard Write ---
+            with self._get_device_handle() as h:
+                self._seek_and_op(h, CONTROL_LBA, data=command_packet)
+                
+        print(f"Control command 0x{cmd_id:X} sent.")
 
     def unlock_device(self):
         """
-        [功能1] 解锁设备写入功能。
-        通过向LBA 170发送一个长度为30个扇区的读请求来实现。
+        [Function 1] Unlock device write function.
+        Sends a raw SCSI READ_10 command for exactly 30 sectors to LBA 170.
         """
-        print(f"正在向 LBA {CONTROL_LBA} 发送读请求 (长度 {UNLOCK_READ_SECTORS} 扇区) 以解锁设备...")
-        with self._get_device_handle(read_only=True) as h:
-            self._seek_and_op(h, CONTROL_LBA, num_sectors_to_read=UNLOCK_READ_SECTORS)
-        print("设备已解锁，可以进行写入。")
+        print(f"Unlocking: Sending READ request to LBA {CONTROL_LBA} (len {UNLOCK_READ_SECTORS})...")
+        
+        if self.platform.startswith('linux'):
+            # --- Linux Implementation: SCSI Passthrough (SG_IO) ---
+            # We must use SG_IO because standard os.read() will be padded 
+            # by the kernel block layer (e.g., 30 sectors -> 32 sectors),
+            # causing the firmware unlock check to fail.
+            
+            # Prepare SCSI READ_10 Command (Opcode 0x28)
+            # Format: [0x28, 0, LBA_3, LBA_2, LBA_1, LBA_0, 0, LEN_H, LEN_L, Control]
+            # SCSI is Big-Endian
+            cdb = struct.pack(
+                '>BBIBH B', 
+                0x28, 0, CONTROL_LBA, 0, UNLOCK_READ_SECTORS, 0
+            )
+            
+            # Create buffers
+            data_len = UNLOCK_READ_SECTORS * SECTOR_SIZE
+            data_buffer = (ctypes.c_ubyte * data_len)()
+            sense_buffer = (ctypes.c_ubyte * 32)()
+            cmd_buffer = (ctypes.c_ubyte * len(cdb)).from_buffer_copy(cdb)
+            
+            # Populate SG_IO Header
+            io_hdr = sg_io_hdr()
+            io_hdr.interface_id = ord('S')
+            io_hdr.dxfer_direction = SG_DXFER_FROM_DEV
+            io_hdr.cmd_len = len(cdb)
+            io_hdr.mx_sb_len = len(sense_buffer)
+            io_hdr.dxfer_len = data_len
+            io_hdr.dxferp = ctypes.cast(data_buffer, ctypes.c_void_p)
+            io_hdr.cmdp = ctypes.cast(cmd_buffer, ctypes.c_void_p)
+            io_hdr.sbp = ctypes.cast(sense_buffer, ctypes.c_void_p)
+            io_hdr.timeout = 5000 # 5 seconds
+            
+            with self._get_device_handle(read_only=True) as fd:
+                # On Linux, fd is an integer
+                try:
+                    fcntl.ioctl(fd, SG_IO, io_hdr)
+                    print("Linux SG_IO Unlock command sent successfully.")
+                except OSError as e:
+                    print(f"Error sending SG_IO command: {e}")
+                    raise
+
+        else:
+            # --- Windows Implementation ---
+            # Windows ReadFile usually respects the exact sector count requested
+            with self._get_device_handle(read_only=True) as h:
+                self._seek_and_op(h, CONTROL_LBA, num_sectors_to_read=UNLOCK_READ_SECTORS)
+                
+        print("Device should be unlocked now.")
 
     def update_progress(self, percentage):
         """
